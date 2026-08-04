@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "core",
     "catalog",
     "analytics",
+    "api",
 ]
 
 MIDDLEWARE = [
@@ -99,3 +100,25 @@ CELERY_RESULT_BACKEND = os.getenv(
 )
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BEAT_SCHEDULE = {}
+
+REST_FRAMEWORK = {
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+
+AMAZON_BEST_SELLERS_URL = os.getenv(
+    "AMAZON_BEST_SELLERS_URL",
+    "https://www.amazon.com/Best-Sellers/zgbs",
+)
+AMAZON_CATEGORIES = [
+    category.strip()
+    for category in os.getenv("AMAZON_CATEGORIES", "").split(",")
+    if category.strip()
+]
+AMAZON_PRODUCTS_PER_CATEGORY = int(
+    os.getenv("AMAZON_PRODUCTS_PER_CATEGORY", "10")
+)
+AMAZON_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("AMAZON_REQUEST_TIMEOUT_SECONDS", "30")
+)
+AMAZON_HEADLESS = env_bool("AMAZON_HEADLESS", default=True)
