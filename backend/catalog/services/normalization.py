@@ -88,6 +88,9 @@ def normalize_title(value: str) -> str:
 
 
 def clean_product_url(value: str | None, asin: str | None = None) -> str:
+    if not value:
+        return f"{AMAZON_ORIGIN}/dp/{asin}" if asin else ""
+
     absolute_url = urljoin(AMAZON_ORIGIN, html.unescape(value or ""))
     resolved_asin = asin or extract_asin(url=absolute_url)
     if resolved_asin:

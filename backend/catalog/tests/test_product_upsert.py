@@ -63,3 +63,32 @@ class ProductUpsertTests(TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(Product.objects.count(), 1)
         self.assertEqual(Product.objects.get().title, "Last version wins")
+
+    def test_repeat_upsert_preserves_search_keyword(self):
+        first_now = timezone.now() - timedelta(hours=1)
+        second_now = timezone.now()
+
+        with patch("catalog.services.product_upsert.timezone.now", return_value=first_now):
+            upsert_products([scraped_product()])
+
+        product = Product.objects.get(asin="B012345678")
+        product.search_keyword = "wireless headphones"
+        product.save(update_fields=["search_keyword"])
+
+        with patch("catalog.services.product_upsert.timezone.now", return_value=second_now):
+            upsert_products(
+                [
+                    scraped_product(
+                        title="Updated Amazon Product",
+                        price=Decimal("19.99"),
+                    )
+                ]
+            )
+
+        self.assertEqual(Product.objects.count(), 1)
+        product.refresh_from_db()
+        self.assertEqual(product.title, "Updated Amazon Product")
+        self.assertEqual(product.price, Decimal("19.99"))
+        self.assertEqual(product.last_seen_at, second_now)
+        self.assertEqual(product.first_seen_at, first_now)
+        self.assertEqual(product.search_keyword, "wireless headphones")

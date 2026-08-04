@@ -15,7 +15,6 @@ UPSERT_UPDATE_FIELDS = [
     "reviews_count",
     "product_url",
     "image_url",
-    "search_keyword",
     "last_seen_at",
     "updated_at",
 ]

@@ -44,3 +44,14 @@ class NormalizationTests(SimpleTestCase):
             ),
             "https://www.amazon.com/dp/B012345678",
         )
+
+    def test_clean_product_url_handles_empty_input(self):
+        cases = [
+            (None, None, ""),
+            ("", None, ""),
+            (None, "B012345678", "https://www.amazon.com/dp/B012345678"),
+        ]
+
+        for value, asin, expected in cases:
+            with self.subTest(value=value, asin=asin):
+                self.assertEqual(clean_product_url(value, asin=asin), expected)
