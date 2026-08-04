@@ -1,0 +1,15 @@
+.env
+.idea/
+.vscode/
+.tmp_doc_review/
+
+__pycache__/
+*.py[cod]
+*.sqlite3
+.pytest_cache/
+.venv/
+celerybeat-schedule*
+
+node_modules/
+dist/
+*.tsbuildinfo
