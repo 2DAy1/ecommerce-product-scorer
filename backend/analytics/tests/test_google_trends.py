@@ -444,6 +444,38 @@ class GoogleTrendsResponseTests(SimpleTestCase):
         parse_response.assert_called_once_with("timeline-response-body")
         page.close.assert_called_once()
 
+    @tag("rate_limit_regression")
+    def test_matching_timeline_rate_limit_stops_collection(self):
+        module = google_trends_module()
+        collector = module.GoogleTrendsCollector()
+        page = MagicMock()
+        collector._browser = MagicMock()
+        collector._browser.new_page.return_value = page
+
+        navigation_response = MagicMock()
+        navigation_response.status = 200
+        page.goto.return_value = navigation_response
+
+        timeline_response = MagicMock()
+        timeline_response.status = 429
+        timeline_response.text.return_value = "sensitive-rate-limit-body"
+        response_info = SimpleNamespace(value=timeline_response)
+        page.expect_response.return_value.__enter__.return_value = response_info
+
+        with (
+            patch.object(module, "parse_google_trends_response") as parse_response,
+            self.assertRaises(rate_limit_error_type(module)) as raised,
+        ):
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertEqual(
+            str(raised.exception),
+            module.GOOGLE_TRENDS_RATE_LIMIT_MESSAGE,
+        )
+        timeline_response.text.assert_not_called()
+        parse_response.assert_not_called()
+        page.close.assert_called_once()
+
 
 class GoogleTrendsSoftTimeoutPassthroughTests(SimpleTestCase):
     @tag("soft_timeout_passthrough_regression")
