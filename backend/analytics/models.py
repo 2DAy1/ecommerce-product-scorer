@@ -52,10 +52,10 @@ class TrendSnapshot(models.Model):
 
 
 class ProductAnalysis(models.Model):
-    product = models.OneToOneField(
+    product = models.ForeignKey(
         Product,
         on_delete=models.CASCADE,
-        related_name="analysis",
+        related_name="analyses",
     )
     trend_score = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     boost_score = models.DecimalField(max_digits=5, decimal_places=2, default=0)
@@ -72,7 +72,13 @@ class ProductAnalysis(models.Model):
     calculated_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        ordering = ["-calculated_at"]
+        ordering = ["-calculated_at", "-pk"]
+        indexes = [
+            models.Index(
+                fields=["product", "-calculated_at"],
+                name="an_analysis_product_calc_idx",
+            )
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=Q(final_score__gte=0) & Q(final_score__lte=100),

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from analytics.models import JobRun
+from analytics.models import JobRun, ProductAnalysis
 from catalog.models import Product, SuccessfulProduct
 from catalog.services.normalization import normalize_title
 from catalog.services.successful_product_import import (
@@ -9,7 +9,31 @@ from catalog.services.successful_product_import import (
 )
 
 
+class LatestProductAnalysisSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductAnalysis
+        fields = [
+            "final_score",
+            "baseline_score",
+            "trend_score",
+            "boost_score",
+            "reasoning",
+            "provider",
+            "model_name",
+            "calculated_at",
+        ]
+
+
 class ProductSerializer(serializers.ModelSerializer):
+    latest_analysis = serializers.SerializerMethodField()
+
+    def get_latest_analysis(self, product):
+        prefetched = getattr(product, "prefetched_analyses", None)
+        analysis = prefetched[0] if prefetched else None
+        if analysis is None:
+            return None
+        return LatestProductAnalysisSerializer(analysis).data
+
     class Meta:
         model = Product
         fields = [
@@ -28,6 +52,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "last_seen_at",
             "created_at",
             "updated_at",
+            "latest_analysis",
         ]
 
 

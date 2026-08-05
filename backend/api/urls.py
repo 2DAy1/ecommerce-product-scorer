@@ -2,6 +2,7 @@ from django.urls import path
 
 from api.views import (
     JobRunDetailView,
+    ProductAnalysisJobCreateView,
     ProductCollectionJobCreateView,
     ProductListView,
     SuccessfulProductImportView,
@@ -20,6 +21,11 @@ urlpatterns = [
         "jobs/trend-collection/",
         TrendCollectionJobCreateView.as_view(),
         name="trend-collection-job-create",
+    ),
+    path(
+        "jobs/product-analysis/",
+        ProductAnalysisJobCreateView.as_view(),
+        name="product-analysis-job-create",
     ),
     path("jobs/<uuid:job_id>/", JobRunDetailView.as_view(), name="job-run-detail"),
     path("products/", ProductListView.as_view(), name="product-list"),

@@ -129,3 +129,11 @@ TRENDS_HEADLESS = env_bool("TRENDS_HEADLESS", default=True)
 TRENDS_REQUEST_TIMEOUT_SECONDS = int(
     os.getenv("TRENDS_REQUEST_TIMEOUT_SECONDS", "30")
 )
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().casefold()
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_MODEL = (
+    os.getenv("LLM_MODEL", "claude-3-5-haiku-latest").strip()
+    or "claude-3-5-haiku-latest"
+)
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "10"))
