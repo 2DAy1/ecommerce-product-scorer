@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.test import tag
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -40,6 +41,36 @@ class JobAndProductApiTests(APITestCase):
         self.assertEqual(job.status, JobRun.Status.PENDING)
         self.assertEqual(job.celery_task_id, "celery-task-id")
         delay.assert_called_once_with(str(job.id))
+
+    @tag("trend_commit_hardening")
+    def test_amazon_queue_failure_finalizes_job_and_truncates_error(self):
+        self.client.force_authenticate(self.user)
+        short_reason = "Redis broker unavailable"
+        long_message = f"{short_reason}: " + ("x" * 2000)
+
+        with patch(
+            "api.views.collect_amazon_products.delay",
+            side_effect=RuntimeError(long_message),
+        ) as delay:
+            response = self.client.post(reverse("product-collection-job-create"))
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(
+            str(response.data["detail"]),
+            "The background job queue is temporarily unavailable.",
+        )
+        job = JobRun.objects.get(job_type=JobRun.JobType.PRODUCT_COLLECTION)
+        delay.assert_called_once_with(str(job.id))
+        self.assertEqual(job.status, JobRun.Status.FAILED)
+        self.assertIsNotNone(job.finished_at)
+        self.assertIsNone(job.started_at)
+        self.assertEqual(job.processed_items, 0)
+        self.assertEqual(job.failed_items, 0)
+        self.assertEqual(job.celery_task_id, "")
+        self.assertLessEqual(len(job.error_message), 200)
+        self.assertNotIn("Google Trends collection", job.error_message)
+        self.assertNotEqual(job.error_message, long_message)
+        self.assertIn(short_reason, job.error_message)
 
     def test_authenticated_job_detail_returns_counters(self):
         self.client.force_authenticate(self.user)

@@ -122,3 +122,10 @@ AMAZON_REQUEST_TIMEOUT_SECONDS = int(
     os.getenv("AMAZON_REQUEST_TIMEOUT_SECONDS", "30")
 )
 AMAZON_HEADLESS = env_bool("AMAZON_HEADLESS", default=True)
+
+TRENDS_GEO = os.getenv("TRENDS_GEO", "US").strip() or "US"
+TRENDS_PERIOD = os.getenv("TRENDS_PERIOD", "today 3-m").strip() or "today 3-m"
+TRENDS_HEADLESS = env_bool("TRENDS_HEADLESS", default=True)
+TRENDS_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("TRENDS_REQUEST_TIMEOUT_SECONDS", "30")
+)

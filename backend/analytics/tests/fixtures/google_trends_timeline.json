@@ -1,0 +1,9 @@
+{
+  "default": {
+    "timelineData": [
+      {"time": "1", "formattedTime": "Jul 1", "value": [40]},
+      {"time": "2", "formattedTime": "Jul 8", "value": [50]},
+      {"time": "3", "formattedTime": "Jul 15", "value": [70]}
+    ]
+  }
+}
