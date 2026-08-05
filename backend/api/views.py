@@ -1,14 +1,23 @@
 from django.utils import timezone
 from rest_framework import filters, generics, status
 from rest_framework.exceptions import APIException
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from analytics.models import JobRun
 from analytics.tasks import collect_amazon_products, collect_google_trends
-from api.serializers import JobRunSerializer, ProductSerializer
-from catalog.models import Product
+from api.serializers import (
+    JobRunSerializer,
+    ProductSerializer,
+    SuccessfulProductSerializer,
+)
+from catalog.models import Product, SuccessfulProduct
+from catalog.services.successful_product_import import (
+    SuccessfulProductImportError,
+    import_successful_products,
+)
 
 
 class QueueUnavailable(APIException):
@@ -74,3 +83,30 @@ class ProductListView(generics.ListAPIView):
     search_fields = ["title", "category"]
     ordering_fields = ["last_seen_at", "rating", "reviews_count", "price"]
     ordering = ["-last_seen_at"]
+
+
+class SuccessfulProductListCreateView(generics.ListCreateAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = SuccessfulProductSerializer
+    queryset = SuccessfulProduct.objects.order_by("category", "title", "pk")
+
+
+class SuccessfulProductImportView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request) -> Response:
+        uploaded_file = request.FILES.get("file")
+        if uploaded_file is None:
+            return Response(
+                {"file": ["This field is required."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = import_successful_products(uploaded_file)
+        except SuccessfulProductImportError as exc:
+            return Response(
+                {"file": exc.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(result, status=status.HTTP_200_OK)
