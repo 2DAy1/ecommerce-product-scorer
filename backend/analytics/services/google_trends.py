@@ -264,6 +264,8 @@ class GoogleTrendsCollector:
                         GOOGLE_TRENDS_RATE_LIMIT_MESSAGE
                     )
             response = response_info.value
+            if response.status == 429:
+                raise GoogleTrendsRateLimitError(GOOGLE_TRENDS_RATE_LIMIT_MESSAGE)
             if response.status >= 400:
                 raise GoogleTrendsNetworkError(
                     f"Google Trends returned HTTP {response.status}"
