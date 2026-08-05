@@ -1,46 +1,74 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 
-type HealthState = "checking" | "healthy" | "unavailable";
+import { api, ApiError, setUnauthorizedHandler } from "./api";
+import DashboardView from "./components/DashboardView.vue";
+import LoginView from "./components/LoginView.vue";
+import type { SessionState } from "./types";
 
-const health = ref<HealthState>("checking");
+const session = ref<SessionState>({ authenticated: false, username: "" });
+const checkingSession = ref(true);
+const loginLoading = ref(false);
+const logoutLoading = ref(false);
+const loginError = ref("");
 
-async function checkBackend(): Promise<void> {
-  health.value = "checking";
+function resetSession(): void {
+  session.value = { authenticated: false, username: "" };
+}
 
+async function checkSession(): Promise<void> {
+  checkingSession.value = true;
+  loginError.value = "";
   try {
-    const response = await fetch("/api/health/");
-    const payload = (await response.json()) as { status?: string };
-    health.value = response.ok && payload.status === "ok" ? "healthy" : "unavailable";
-  } catch {
-    health.value = "unavailable";
+    session.value = await api.getSession();
+  } catch (caught) {
+    resetSession();
+    loginError.value = caught instanceof ApiError ? caught.message : "Unable to reach the application.";
+  } finally {
+    checkingSession.value = false;
   }
 }
 
-onMounted(checkBackend);
+async function signIn(username: string, password: string): Promise<void> {
+  if (loginLoading.value) return;
+  loginLoading.value = true;
+  loginError.value = "";
+  try {
+    session.value = await api.login(username, password);
+  } catch (caught) {
+    loginError.value = caught instanceof ApiError ? caught.message : "Unable to sign in.";
+  } finally {
+    loginLoading.value = false;
+  }
+}
+
+async function signOut(): Promise<void> {
+  if (logoutLoading.value) return;
+  logoutLoading.value = true;
+  try {
+    await api.logout();
+  } catch {
+    // Close the authenticated view even when the server session already expired.
+  } finally {
+    resetSession();
+    logoutLoading.value = false;
+  }
+}
+
+setUnauthorizedHandler(resetSession);
+onMounted(checkSession);
 </script>
 
 <template>
-  <main class="shell">
-    <section class="card">
-      <p class="eyebrow">Infrastructure skeleton</p>
-      <h1>Parser MVP</h1>
-      <p class="lead">
-        Django, Vue, PostgreSQL, Redis і Celery готові до наступного етапу.
-      </p>
-
-      <div class="status-row" :data-state="health">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span v-if="health === 'checking'">Перевіряємо backend…</span>
-        <span v-else-if="health === 'healthy'">Backend працює</span>
-        <span v-else>Backend недоступний</span>
-      </div>
-
-      <button type="button" @click="checkBackend">Перевірити ще раз</button>
-
-      <p class="scope-note">
-        Scraping, Google Trends, scoring і бізнес-моделі не входять до цього етапу.
-      </p>
-    </section>
+  <main v-if="checkingSession" class="loading-shell">
+    <div class="loading-mark" aria-hidden="true"></div>
+    <p>Opening dashboard…</p>
   </main>
+  <DashboardView
+    v-else-if="session.authenticated"
+    :username="session.username"
+    :logging-out="logoutLoading"
+    @logout="signOut"
+  />
+  <LoginView v-else :loading="loginLoading" :error="loginError" @submit="signIn" />
 </template>
