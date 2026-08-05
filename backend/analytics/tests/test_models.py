@@ -71,7 +71,7 @@ class ProductAnalysisModelTests(TestCase):
     def setUp(self) -> None:
         self.product = create_product()
 
-    def test_defaults_and_one_to_one_relationship(self) -> None:
+    def test_defaults_and_product_relationship(self) -> None:
         analysis = ProductAnalysis.objects.create(product=self.product)
         analysis.refresh_from_db()
 
@@ -83,14 +83,13 @@ class ProductAnalysisModelTests(TestCase):
         self.assertEqual(analysis.model_name, "")
         self.assertEqual(analysis.reasoning, "")
         self.assertEqual(analysis.input_snapshot, {})
-        self.assertEqual(self.product.analysis, analysis)
+        self.assertEqual(self.product.analyses.get(), analysis)
 
-    def test_only_one_analysis_is_allowed_per_product(self) -> None:
+    def test_multiple_analyses_preserve_product_history(self) -> None:
+        ProductAnalysis.objects.create(product=self.product)
         ProductAnalysis.objects.create(product=self.product)
 
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                ProductAnalysis.objects.create(product=self.product)
+        self.assertEqual(self.product.analyses.count(), 2)
 
     def test_final_score_must_be_between_zero_and_one_hundred(self) -> None:
         for score in (Decimal("-0.01"), Decimal("100.01")):

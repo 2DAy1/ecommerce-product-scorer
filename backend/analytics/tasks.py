@@ -5,7 +5,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from analytics.models import JobRun
+from analytics.models import JobRun, TrendSnapshot
 from analytics.services.amazon_scraper import (
     AmazonBestSellersScraper,
     BrowserStartupError,
@@ -16,9 +16,11 @@ from analytics.services.google_trends import (
     GoogleTrendsCollector,
     GoogleTrendsRateLimitError,
 )
+from analytics.services.llm_analysis import build_llm_client
+from analytics.services.product_analysis import create_product_analysis
 from analytics.services.trend_keywords import select_trend_keyword
 from analytics.services.trend_persistence import collect_product_trend
-from catalog.models import Product
+from catalog.models import Product, SuccessfulProduct
 from catalog.services.product_upsert import upsert_products
 
 
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_SCRAPER_ERRORS = (BrowserStartupError, TemporaryNetworkError)
 TRENDS_SOFT_TIMEOUT_MESSAGE = "Google Trends collection stopped by soft timeout"
+ANALYSIS_SOFT_TIMEOUT_MESSAGE = "Product analysis stopped by soft timeout"
 
 
 def _mark_failed(job: JobRun, exc: Exception) -> None:
@@ -314,6 +317,181 @@ def collect_google_trends(self, job_id: str) -> dict[str, int]:
         "errors_count": failed_items,
         "errors": errors[:10],
     }
+    job.finished_at = timezone.now()
+    job.save(
+        update_fields=[
+            "status",
+            "processed_items",
+            "failed_items",
+            "error_message",
+            "details",
+            "finished_at",
+        ]
+    )
+    return {
+        "total_items": job.total_items,
+        "processed_items": job.processed_items,
+        "failed_items": job.failed_items,
+    }
+
+
+@shared_task(
+    bind=True,
+    name="analytics.analyze_products",
+    soft_time_limit=300,
+    time_limit=330,
+)
+def analyze_products(self, job_id: str) -> dict[str, int]:
+    job = JobRun.objects.get(
+        pk=job_id,
+        job_type=JobRun.JobType.PRODUCT_ANALYSIS,
+    )
+    if job.status != JobRun.Status.PENDING:
+        raise ValueError(f"Product analysis JobRun must be pending, got {job.status}")
+
+    products = list(Product.objects.order_by("pk"))
+    job.status = JobRun.Status.RUNNING
+    job.celery_task_id = self.request.id or job.celery_task_id
+    job.total_items = len(products)
+    job.processed_items = 0
+    job.failed_items = 0
+    job.error_message = ""
+    job.details = {}
+    job.started_at = job.started_at or timezone.now()
+    job.finished_at = None
+    job.save(
+        update_fields=[
+            "status",
+            "celery_task_id",
+            "total_items",
+            "processed_items",
+            "failed_items",
+            "error_message",
+            "details",
+            "started_at",
+            "finished_at",
+        ]
+    )
+
+    if not products:
+        job.status = JobRun.Status.FAILED
+        job.error_message = "No products available for product analysis"
+        job.finished_at = timezone.now()
+        job.save(update_fields=["status", "error_message", "finished_at"])
+        return {"total_items": 0, "processed_items": 0, "failed_items": 0}
+
+    processed_items = 0
+    failed_items = 0
+    errors: list[dict[str, str | int]] = []
+    try:
+        product_ids = [product.pk for product in products]
+        latest_snapshots = {
+            snapshot.product_id: snapshot
+            for snapshot in TrendSnapshot.objects.filter(
+                product_id__in=product_ids
+            )
+            .order_by("product_id", "-collected_at", "-pk")
+            .distinct("product_id")
+        }
+        successful_products = list(SuccessfulProduct.objects.order_by("pk"))
+        llm_client = build_llm_client(settings)
+
+        for product in products:
+            try:
+                create_product_analysis(
+                    product,
+                    trend_snapshot=latest_snapshots.get(product.pk),
+                    successful_products=successful_products,
+                    llm_client=llm_client,
+                )
+                processed_items += 1
+            except SoftTimeLimitExceeded:
+                failed_items += 1
+                errors.append(
+                    {
+                        "product_id": product.pk,
+                        "asin": product.asin,
+                        "error": ANALYSIS_SOFT_TIMEOUT_MESSAGE,
+                    }
+                )
+                raise
+            except Exception as exc:
+                failed_items += 1
+                errors.append(
+                    {
+                        "product_id": product.pk,
+                        "asin": product.asin,
+                        "error": str(exc)[:200],
+                    }
+                )
+                logger.warning(
+                    "Product analysis failed product_id=%s asin=%s error=%s",
+                    product.pk,
+                    product.asin,
+                    str(exc)[:200],
+                )
+    except SoftTimeLimitExceeded:
+        skipped_items = max(0, len(products) - processed_items - failed_items)
+        failed_items += skipped_items
+        job.status = JobRun.Status.FAILED
+        job.processed_items = processed_items
+        job.failed_items = failed_items
+        job.error_message = ANALYSIS_SOFT_TIMEOUT_MESSAGE
+        job.details = {
+            "errors_count": failed_items,
+            "errors": errors[:10],
+            "timeout": True,
+            "skipped_items": skipped_items,
+        }
+        job.finished_at = timezone.now()
+        job.save(
+            update_fields=[
+                "status",
+                "processed_items",
+                "failed_items",
+                "error_message",
+                "details",
+                "finished_at",
+            ]
+        )
+        raise
+    except Exception as exc:
+        skipped_items = max(0, len(products) - processed_items - failed_items)
+        failed_items += skipped_items
+        errors.append({"product_id": 0, "asin": "", "error": str(exc)[:200]})
+        job.status = JobRun.Status.FAILED
+        job.processed_items = processed_items
+        job.failed_items = failed_items
+        job.error_message = "Product analysis batch failed"
+        job.details = {
+            "errors_count": failed_items,
+            "errors": errors[:10],
+            "skipped_items": skipped_items,
+        }
+        job.finished_at = timezone.now()
+        job.save(
+            update_fields=[
+                "status",
+                "processed_items",
+                "failed_items",
+                "error_message",
+                "details",
+                "finished_at",
+            ]
+        )
+        raise
+
+    job.status = (
+        JobRun.Status.SUCCEEDED if processed_items else JobRun.Status.FAILED
+    )
+    job.processed_items = processed_items
+    job.failed_items = failed_items
+    job.error_message = (
+        f"{failed_items} of {len(products)} products failed product analysis"
+        if failed_items
+        else ""
+    )
+    job.details = {"errors_count": failed_items, "errors": errors[:10]}
     job.finished_at = timezone.now()
     job.save(
         update_fields=[

@@ -104,6 +104,10 @@ services:
       TRENDS_PERIOD: ${TRENDS_PERIOD:-today 3-m}
       TRENDS_HEADLESS: ${TRENDS_HEADLESS:-true}
       TRENDS_REQUEST_TIMEOUT_SECONDS: ${TRENDS_REQUEST_TIMEOUT_SECONDS:-30}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-3-5-haiku-latest}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-10}
     depends_on:
       backend:
         condition: service_healthy

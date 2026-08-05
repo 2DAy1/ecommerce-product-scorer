@@ -1,3 +1,4 @@
+from django.db.models import Prefetch
 from django.utils import timezone
 from rest_framework import filters, generics, status
 from rest_framework.exceptions import APIException
@@ -6,8 +7,12 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from analytics.models import JobRun
-from analytics.tasks import collect_amazon_products, collect_google_trends
+from analytics.models import JobRun, ProductAnalysis
+from analytics.tasks import (
+    analyze_products,
+    collect_amazon_products,
+    collect_google_trends,
+)
 from api.serializers import (
     JobRunSerializer,
     ProductSerializer,
@@ -68,6 +73,17 @@ class TrendCollectionJobCreateView(APIView):
         return Response(JobRunSerializer(job).data, status=status.HTTP_202_ACCEPTED)
 
 
+class ProductAnalysisJobCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request) -> Response:
+        job = _create_and_queue_job(
+            JobRun.JobType.PRODUCT_ANALYSIS,
+            analyze_products,
+        )
+        return Response(JobRunSerializer(job).data, status=status.HTTP_202_ACCEPTED)
+
+
 class JobRunDetailView(generics.RetrieveAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = JobRunSerializer
@@ -78,7 +94,15 @@ class JobRunDetailView(generics.RetrieveAPIView):
 class ProductListView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = ProductSerializer
-    queryset = Product.objects.all()
+    queryset = Product.objects.prefetch_related(
+        Prefetch(
+            "analyses",
+            queryset=ProductAnalysis.objects.order_by(
+                "-calculated_at", "-pk"
+            )[:1],
+            to_attr="prefetched_analyses",
+        )
+    )
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["title", "category"]
     ordering_fields = ["last_seen_at", "rating", "reviews_count", "price"]
