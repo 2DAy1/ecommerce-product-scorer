@@ -1,5 +1,6 @@
 import csv
 import io
+from typing import cast
 
 from django.db import transaction
 
@@ -37,7 +38,7 @@ def normalize_keywords(values: list[str]) -> list[str]:
     return keywords
 
 
-def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
+def _validate_uploaded_csv_file(uploaded_file) -> None:
     filename = str(getattr(uploaded_file, "name", ""))
     if not filename.lower().endswith(".csv"):
         raise SuccessfulProductImportError(["Upload must be a .csv file."])
@@ -48,6 +49,8 @@ def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
             [f"CSV file must not exceed {MAX_CSV_FILE_SIZE} bytes."]
         )
 
+
+def _read_csv_text(uploaded_file) -> str:
     payload = uploaded_file.read()
     if not payload:
         raise SuccessfulProductImportError(["CSV file is empty."])
@@ -66,12 +69,21 @@ def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
         raise SuccessfulProductImportError(["CSV file is empty."])
     if "\x00" in text:
         raise SuccessfulProductImportError(["CSV file contains invalid null bytes."])
+    return text
 
-    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+
+def _build_csv_reader(text: str) -> csv.DictReader:
+    return csv.DictReader(io.StringIO(text, newline=""), strict=True)
+
+
+def _read_csv_headers(reader: csv.DictReader) -> list[str]:
     try:
-        headers = reader.fieldnames or []
+        return reader.fieldnames or []
     except csv.Error as exc:
         raise SuccessfulProductImportError([f"Malformed CSV: {exc}."]) from exc
+
+
+def _validate_csv_headers(headers: list[str]) -> None:
     missing_headers = [header for header in CSV_HEADERS if header not in headers]
     extra_headers = [header for header in headers if header not in CSV_HEADERS]
     duplicate_headers = sorted(
@@ -89,71 +101,91 @@ def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
     if header_errors:
         raise SuccessfulProductImportError(header_errors)
 
+
+def _format_row_errors(row_number: int, messages: list[str]) -> list[str]:
+    return [f"Row {row_number}: {message}." for message in messages]
+
+
+def _parse_successful_product_row(
+    row: dict[str | None, object], row_number: int
+) -> tuple[dict[str, object] | None, list[str]]:
+    if None in row or any(value is None for value in row.values()):
+        return None, _format_row_errors(
+            row_number, ["column count does not match headers"]
+        )
+    row_values = cast(dict[str, str], row)
+    if all(not value.strip() for value in row_values.values()):
+        return None, _format_row_errors(row_number, ["data row is empty"])
+
+    title = collapse_whitespace(row_values["title"])
+    category = collapse_whitespace(row_values["category"])
+    row_errors: list[str] = []
+    if not title:
+        row_errors.append("title is required")
+    elif len(title) > TITLE_MAX_LENGTH:
+        row_errors.append(f"title must not exceed {TITLE_MAX_LENGTH} characters")
+    if not category:
+        row_errors.append("category is required")
+    elif len(category) > CATEGORY_MAX_LENGTH:
+        row_errors.append(
+            f"category must not exceed {CATEGORY_MAX_LENGTH} characters"
+        )
+
+    normalized_title = normalize_title(title)
+    if title and not normalized_title:
+        row_errors.append("title must contain letters or numbers")
+
+    raw_keywords = row_values["keywords"].strip()
+    try:
+        keywords = (
+            normalize_keywords(raw_keywords.split(";")) if raw_keywords else []
+        )
+    except ValueError as exc:
+        row_errors.append(str(exc))
+
+    if row_errors:
+        return None, _format_row_errors(row_number, row_errors)
+
+    return {
+        "title": title,
+        "normalized_title": normalized_title,
+        "category": category,
+        "keywords": keywords,
+    }, []
+
+
+def _natural_key_for_row(row: dict[str, object]) -> tuple[str, str]:
+    return cast(str, row["normalized_title"]), cast(str, row["category"])
+
+
+def _find_duplicate_natural_key(
+    row: dict[str, object], seen_keys: dict[tuple[str, str], int]
+) -> int | None:
+    return seen_keys.get(_natural_key_for_row(row))
+
+
+def _parse_csv_rows(reader: csv.DictReader) -> list[dict[str, object]]:
     parsed_rows: list[dict[str, object]] = []
     errors: list[str] = []
     seen_keys: dict[tuple[str, str], int] = {}
     try:
         for row in reader:
             row_number = reader.line_num
-            if None in row or any(value is None for value in row.values()):
-                errors.append(f"Row {row_number}: column count does not match headers.")
-                continue
-            if all(not value.strip() for value in row.values()):
-                errors.append(f"Row {row_number}: data row is empty.")
+            parsed_row, row_errors = _parse_successful_product_row(row, row_number)
+            if parsed_row is None:
+                errors.extend(row_errors)
                 continue
 
-            title = collapse_whitespace(row["title"])
-            category = collapse_whitespace(row["category"])
-            row_errors: list[str] = []
-            if not title:
-                row_errors.append("title is required")
-            elif len(title) > TITLE_MAX_LENGTH:
-                row_errors.append(
-                    f"title must not exceed {TITLE_MAX_LENGTH} characters"
-                )
-            if not category:
-                row_errors.append("category is required")
-            elif len(category) > CATEGORY_MAX_LENGTH:
-                row_errors.append(
-                    f"category must not exceed {CATEGORY_MAX_LENGTH} characters"
-                )
-
-            normalized_title = normalize_title(title)
-            if title and not normalized_title:
-                row_errors.append("title must contain letters or numbers")
-
-            raw_keywords = row["keywords"].strip()
-            try:
-                keywords = (
-                    normalize_keywords(raw_keywords.split(";"))
-                    if raw_keywords
-                    else []
-                )
-            except ValueError as exc:
-                row_errors.append(str(exc))
-
-            if row_errors:
-                errors.extend(
-                    f"Row {row_number}: {message}." for message in row_errors
-                )
-                continue
-
-            natural_key = (normalized_title, category)
-            if natural_key in seen_keys:
+            duplicate_row_number = _find_duplicate_natural_key(parsed_row, seen_keys)
+            if duplicate_row_number is not None:
                 errors.append(
-                    f"Row {row_number}: duplicates row {seen_keys[natural_key]} "
+                    f"Row {row_number}: duplicates row {duplicate_row_number} "
                     "by normalized title and category."
                 )
                 continue
+            natural_key = _natural_key_for_row(parsed_row)
             seen_keys[natural_key] = row_number
-            parsed_rows.append(
-                {
-                    "title": title,
-                    "normalized_title": normalized_title,
-                    "category": category,
-                    "keywords": keywords,
-                }
-            )
+            parsed_rows.append(parsed_row)
     except csv.Error as exc:
         errors.append(f"Row {reader.line_num}: malformed CSV: {exc}.")
 
@@ -162,6 +194,15 @@ def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
     if errors:
         raise SuccessfulProductImportError(errors)
     return parsed_rows
+
+
+def parse_successful_products_csv(uploaded_file) -> list[dict[str, object]]:
+    _validate_uploaded_csv_file(uploaded_file)
+    text = _read_csv_text(uploaded_file)
+    reader = _build_csv_reader(text)
+    headers = _read_csv_headers(reader)
+    _validate_csv_headers(headers)
+    return _parse_csv_rows(reader)
 
 
 def import_successful_products(uploaded_file) -> dict[str, int]:
