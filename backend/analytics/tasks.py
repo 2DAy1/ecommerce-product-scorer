@@ -114,6 +114,25 @@ def collect_amazon_products(self, job_id: str) -> dict[str, int]:
     }
 
 
+@shared_task(name="analytics.schedule_amazon_collection")
+def schedule_amazon_collection() -> dict[str, str]:
+    job = JobRun.objects.create(job_type=JobRun.JobType.PRODUCT_COLLECTION)
+    try:
+        result = collect_amazon_products.delay(str(job.id))
+    except Exception as exc:
+        job.status = JobRun.Status.FAILED
+        job.error_message = (
+            f"Failed to enqueue scheduled Amazon collection: {exc}"
+        )[:200]
+        job.finished_at = timezone.now()
+        job.save(update_fields=["status", "error_message", "finished_at"])
+        raise
+
+    job.celery_task_id = result.id
+    job.save(update_fields=["celery_task_id"])
+    return {"job_id": str(job.id)}
+
+
 @shared_task(
     bind=True,
     name="analytics.collect_google_trends",

@@ -99,7 +99,6 @@ CELERY_RESULT_BACKEND = os.getenv(
     "CELERY_RESULT_BACKEND", "redis://redis:6379/1"
 )
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-CELERY_BEAT_SCHEDULE = {}
 
 REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
@@ -122,6 +121,16 @@ AMAZON_REQUEST_TIMEOUT_SECONDS = int(
     os.getenv("AMAZON_REQUEST_TIMEOUT_SECONDS", "30")
 )
 AMAZON_HEADLESS = env_bool("AMAZON_HEADLESS", default=True)
+AMAZON_COLLECTION_INTERVAL_SECONDS = int(
+    os.getenv("AMAZON_COLLECTION_INTERVAL_SECONDS", str(6 * 60 * 60))
+)
+
+CELERY_BEAT_SCHEDULE = {
+    "amazon-products-every-six-hours": {
+        "task": "analytics.schedule_amazon_collection",
+        "schedule": AMAZON_COLLECTION_INTERVAL_SECONDS,
+    }
+}
 
 TRENDS_GEO = os.getenv("TRENDS_GEO", "US").strip() or "US"
 TRENDS_PERIOD = os.getenv("TRENDS_PERIOD", "today 3-m").strip() or "today 3-m"
