@@ -98,6 +98,35 @@ class ProductAnalysisApiTests(APITestCase):
         self.assertEqual(latest["provider"], "anthropic")
         self.assertNotIn("Old explanation", str(response.data))
 
+    def test_product_list_exposes_product_and_image_urls(self):
+        product = create_product()
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(self.product_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        serialized = response.data["results"][0]
+        self.assertEqual(serialized["product_url"], product.product_url)
+        self.assertEqual(serialized["image_url"], product.image_url)
+
+    def test_missing_product_and_image_urls_remain_valid(self):
+        Product.objects.create(
+            asin="B000000002",
+            title="Product without source media",
+            normalized_title="product without source media",
+            category="Electronics",
+            product_url="",
+            image_url="",
+        )
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(self.product_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        serialized = response.data["results"][0]
+        self.assertEqual(serialized["product_url"], "")
+        self.assertEqual(serialized["image_url"], "")
+
     def test_products_without_analysis_remain_valid_and_paginated(self):
         for index in range(21):
             create_product(f"B{index:09d}")

@@ -148,6 +148,183 @@ class ProductScoringTests(SimpleTestCase):
 
         self.assertGreater(exact.score, keyword.score)
 
+    def test_exact_apple_earpods_title_and_category_keeps_maximum_boost(self):
+        title = (
+            "Apple EarPods Headphones with USB-C Plug, Wired Ear Buds with "
+            "Built-in Remote to Control Music, Phone Calls, and Volume"
+        )
+
+        result = calculate_sales_boost(
+            product(
+                title=title,
+                normalized_title=title,
+                category="Amazon Best Sellers",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title=title,
+                    normalized_title=title,
+                    category="Amazon Best Sellers",
+                    keywords=["apple", "earpods", "headphones"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("10.00"))
+        self.assertEqual(result.reason, "Exact normalized title and category match")
+
+    def test_stop_word_with_does_not_boost_blink(self):
+        result = calculate_sales_boost(
+            product(
+                title="blink plus plan with monthly auto-renewal",
+                normalized_title="blink plus plan with monthly auto renewal",
+                category="Amazon Best Sellers",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title="Apple EarPods Headphones with USB-C Plug",
+                    normalized_title="apple earpods headphones with usb c plug",
+                    category="Amazon Best Sellers",
+                    keywords=["apple", "earpods", "headphones"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("0.00"))
+        self.assertEqual(result.matched_tokens, ())
+        self.assertNotIn("with", result.reason)
+
+    def test_generic_amazon_category_does_not_add_keyword_bonus(self):
+        result = calculate_sales_boost(
+            product(
+                title="Reusable Collagen Mask",
+                normalized_title="reusable collagen mask",
+                category="Amazon Best Sellers",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title="Collagen Serum",
+                    normalized_title="collagen serum",
+                    category="amazon best sellers",
+                    keywords=["collagen"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("1.25"))
+        self.assertEqual(result.reason, "Keyword-token match: collagen")
+
+    def test_stop_words_are_excluded_from_tokens_and_reasoning(self):
+        result = calculate_sales_boost(
+            product(
+                title="The mask with collagen and acne",
+                normalized_title="the mask with collagen and acne",
+                category="Beauty",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title="A mask for collagen in skincare",
+                    normalized_title="a mask for collagen in skincare",
+                    category="Other",
+                    keywords=[],
+                )
+            ],
+        )
+
+        self.assertEqual(result.matched_tokens, ("collagen", "mask"))
+        for stop_word in ("a", "and", "for", "in", "the", "with"):
+            self.assertNotIn(stop_word, result.matched_tokens)
+        self.assertEqual(result.reason, "Keyword-token match: collagen, mask")
+
+    def test_biodance_keeps_meaningful_keyword_boost(self):
+        result = calculate_sales_boost(
+            product(
+                title=(
+                    "BIODANCE Bio-Collagen Real Deep Mask, Hydrating Overnight "
+                    "Hydrogel Face Mask"
+                ),
+                normalized_title=(
+                    "biodance bio collagen real deep mask hydrating overnight "
+                    "hydrogel face mask"
+                ),
+                category="Amazon Best Sellers",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title="BIODANCE Bio-Collagen Real Deep Mask",
+                    normalized_title="biodance bio collagen real deep mask",
+                    category="Amazon Best Sellers",
+                    keywords=["mask", "collagen", "skincare"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("4.00"))
+        self.assertIn("biodance", result.matched_tokens)
+        self.assertIn("collagen", result.matched_tokens)
+        self.assertIn("mask", result.matched_tokens)
+
+    def test_mighty_patch_keeps_meaningful_keyword_boost(self):
+        result = calculate_sales_boost(
+            product(
+                title=(
+                    "Mighty Patch Hero Cosmetics Original Nighttime Acne Pimple "
+                    "Patches, 36 Ct | #1 Hydrocolloid Acne Patches"
+                ),
+                normalized_title=(
+                    "mighty patch hero cosmetics original nighttime acne pimple "
+                    "patches 36 ct 1 hydrocolloid acne patches"
+                ),
+                category="Amazon Best Sellers",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title=(
+                        "Mighty Patch Hero Cosmetics Original Nighttime Acne "
+                        "Pimple Patches"
+                    ),
+                    normalized_title=(
+                        "mighty patch hero cosmetics original nighttime acne "
+                        "pimple patches"
+                    ),
+                    category="Amazon Best Sellers",
+                    keywords=["acne", "patches", "skincare"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("4.00"))
+        self.assertIn("acne", result.matched_tokens)
+        self.assertIn("patch", result.matched_tokens)
+        self.assertIn("patches", result.matched_tokens)
+
+    def test_meaningful_category_match_keeps_existing_bonus(self):
+        result = calculate_sales_boost(
+            product(
+                title="Wireless Charger Stand",
+                normalized_title="wireless charger stand",
+                category="Electronics",
+                search_keyword="",
+            ),
+            [
+                successful(
+                    title="Wireless Adapter",
+                    normalized_title="wireless adapter",
+                    category="electronics",
+                    keywords=["wireless"],
+                )
+            ],
+        )
+
+        self.assertEqual(result.score, Decimal("3.25"))
+        self.assertEqual(result.reason, "Category and keyword-token match: wireless")
+
     def test_empty_and_one_character_keywords_do_not_match(self):
         result = calculate_sales_boost(
             product(title="A", normalized_title="a", search_keyword=""),

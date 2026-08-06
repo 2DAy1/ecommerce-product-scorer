@@ -30,6 +30,7 @@ export interface Product {
   rating: string | null;
   reviews_count: number;
   product_url: string;
+  image_url: string;
   search_keyword: string;
   latest_analysis: LatestAnalysis | null;
 }
