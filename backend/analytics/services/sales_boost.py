@@ -9,6 +9,30 @@ EXACT_TITLE_BOOST = Decimal("7.50")
 CATEGORY_KEYWORD_BONUS = Decimal("2.00")
 KEYWORD_TOKEN_BOOST = Decimal("1.25")
 MAX_KEYWORD_BOOST = Decimal("4.00")
+NON_INFORMATIVE_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
+NON_INFORMATIVE_CATEGORIES = frozenset({"amazon best sellers"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,15 +47,17 @@ def _normalized(value: object) -> str:
     return normalize_title(value) if isinstance(value, str) else ""
 
 
-def _tokens(*values: object) -> set[str]:
-    tokens: set[str] = set()
-    for value in values:
-        tokens.update(
-            token
-            for token in _normalized(value).split()
-            if len(token) > 1
-        )
-    return tokens
+def _tokens(*values: object) -> frozenset[str]:
+    return frozenset(
+        token
+        for value in values
+        for token in _normalized(value).split()
+        if len(token) > 1 and token not in NON_INFORMATIVE_TOKENS
+    )
+
+
+def _is_informative_category(category: str) -> bool:
+    return bool(category and category not in NON_INFORMATIVE_CATEGORIES)
 
 
 def _candidate_result(product, successful_product) -> SalesBoostResult:
@@ -42,11 +68,14 @@ def _candidate_result(product, successful_product) -> SalesBoostResult:
     product_category = _normalized(product.category)
     successful_category = _normalized(successful_product.category)
     title_matches = bool(product_title and product_title == successful_title)
-    category_matches = bool(
+    same_category = bool(
         product_category and product_category == successful_category
     )
+    category_bonus_applies = same_category and _is_informative_category(
+        product_category
+    )
 
-    if title_matches and category_matches:
+    if title_matches and same_category:
         return SalesBoostResult(
             score=MAX_BOOST,
             reason="Exact normalized title and category match",
@@ -73,13 +102,13 @@ def _candidate_result(product, successful_product) -> SalesBoostResult:
         MAX_KEYWORD_BOOST,
     )
     score = keyword_score + (
-        CATEGORY_KEYWORD_BONUS if category_matches else Decimal("0.00")
+        CATEGORY_KEYWORD_BONUS if category_bonus_applies else Decimal("0.00")
     )
     return SalesBoostResult(
         score=min(score, EXACT_TITLE_BOOST),
         reason=(
             "Category and keyword-token match: "
-            if category_matches
+            if category_bonus_applies
             else "Keyword-token match: "
         )
         + ", ".join(matched_tokens),

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { ref } from "vue";
+
 import type { PaginatedResponse, Product } from "../types";
 
 defineProps<{
@@ -15,6 +17,11 @@ const money = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 const integer = new Intl.NumberFormat("en-US");
+const failedImages = ref<Record<number, boolean>>({});
+
+function markImageFailed(productId: number): void {
+  failedImages.value[productId] = true;
+}
 
 function formatMoney(value: string | null): string {
   return value === null ? "—" : money.format(Number(value));
@@ -53,10 +60,32 @@ function formatDate(value: string): string {
       <tbody>
         <tr v-for="product in page.results" :key="product.id">
           <td class="product-cell">
-            <a :href="product.product_url" target="_blank" rel="noreferrer">
-              {{ product.title }}
-            </a>
-            <span class="secondary">ASIN {{ product.asin }}</span>
+            <div class="product-summary">
+              <div class="product-thumbnail">
+                <img
+                  v-if="product.image_url && !failedImages[product.id]"
+                  :src="product.image_url"
+                  :alt="`${product.title} thumbnail`"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="markImageFailed(product.id)"
+                />
+                <span v-else class="product-image-fallback">No image</span>
+              </div>
+              <div class="product-copy">
+                <a
+                  v-if="product.product_url"
+                  class="product-title"
+                  :href="product.product_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ product.title }}
+                </a>
+                <span v-else class="product-title">{{ product.title }}</span>
+                <span class="secondary">ASIN {{ product.asin }}</span>
+              </div>
+            </div>
           </td>
           <td>{{ product.category || "—" }}</td>
           <td>
