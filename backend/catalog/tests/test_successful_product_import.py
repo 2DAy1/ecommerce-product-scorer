@@ -1,3 +1,5 @@
+import io
+
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase
 
@@ -64,6 +66,71 @@ class SuccessfulProductCsvParserTests(SimpleTestCase):
             )
 
         self.assertIn("Malformed CSV", raised.exception.errors[0])
+
+    def test_parser_reports_header_errors_in_existing_order(self):
+        with self.assertRaises(SuccessfulProductImportError) as raised:
+            parse_successful_products_csv(
+                csv_upload("title,title,unexpected\nProduct,Duplicate,extra\n")
+            )
+
+        self.assertEqual(
+            raised.exception.errors,
+            [
+                "Missing required headers: category, keywords.",
+                "Unexpected headers: unexpected.",
+                "Duplicate headers: title.",
+            ],
+        )
+
+    def test_parser_reports_duplicate_natural_key_row_numbers(self):
+        with self.assertRaises(SuccessfulProductImportError) as raised:
+            parse_successful_products_csv(
+                csv_upload(
+                    "title,category,keywords\n"
+                    "Winning Product,Home,home\n"
+                    " Winning   Product ,Home,popular\n"
+                )
+            )
+
+        self.assertEqual(
+            raised.exception.errors,
+            [
+                "Row 3: duplicates row 2 by normalized title and category.",
+            ],
+        )
+
+    def test_parser_rejects_oversized_payload_despite_file_size_metadata(self):
+        payload = b"x" * (1024 * 1024 + 1)
+
+        for declared_size in (None, 1):
+            with self.subTest(declared_size=declared_size):
+                uploaded_file = io.BytesIO(payload)
+                uploaded_file.name = "products.csv"
+                if declared_size is not None:
+                    uploaded_file.size = declared_size
+
+                with self.assertRaises(SuccessfulProductImportError) as raised:
+                    parse_successful_products_csv(uploaded_file)
+
+                self.assertEqual(
+                    raised.exception.errors,
+                    ["CSV file must not exceed 1048576 bytes."],
+                )
+
+    def test_parser_reports_body_level_csv_error_exactly(self):
+        with self.assertRaises(SuccessfulProductImportError) as raised:
+            parse_successful_products_csv(
+                csv_upload(
+                    "title,category,keywords\n"
+                    "Valid Product,Home,home\n"
+                    '"Unterminated Product,Home,home\n'
+                )
+            )
+
+        self.assertEqual(
+            raised.exception.errors,
+            ["Row 2: malformed CSV: unexpected end of data."],
+        )
 
 
 class SuccessfulProductImportTests(TestCase):
