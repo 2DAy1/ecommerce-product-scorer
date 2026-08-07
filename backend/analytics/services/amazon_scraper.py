@@ -99,6 +99,83 @@ class AmazonBestSellersScraper:
                 return cards
         return page.locator(".__amazon_card_selector_did_not_match__")
 
+    def _parse_product_card(
+        self,
+        card,
+        *,
+        category: str,
+        href: str,
+        asin: str | None,
+    ) -> ScrapedProduct | None:
+        title = self._first_text(card, TITLE_SELECTORS)
+        image_url = self._first_attribute(card, IMAGE_SELECTORS, "src")
+        if not title:
+            title = self._first_attribute(card, IMAGE_SELECTORS, "alt")
+        if not asin or not title:
+            return None
+
+        price = parse_price(self._first_text(card, PRICE_SELECTORS))
+        rating_text = self._first_text(card, RATING_SELECTORS) or self._first_attribute(
+            card,
+            RATING_SELECTORS,
+            "aria-label",
+        )
+        reviews_count = parse_reviews_count(
+            self._first_text(card, REVIEWS_SELECTORS)
+        )
+
+        return ScrapedProduct(
+            asin=asin,
+            title=title,
+            category=category,
+            price=price,
+            rating=parse_rating(rating_text),
+            reviews_count=reviews_count,
+            product_url=clean_product_url(href, asin),
+            image_url=image_url,
+        )
+
+    def _parse_card_safely(
+        self,
+        card,
+        *,
+        category: str,
+    ) -> ScrapedProduct | None:
+        asin_for_log = "unknown"
+        try:
+            href = self._first_attribute(card, LINK_SELECTORS, "href")
+            asin = extract_asin(card.get_attribute("data-asin"), href)
+            asin_for_log = asin or "missing"
+            product = self._parse_product_card(
+                card,
+                category=category,
+                href=href,
+                asin=asin,
+            )
+            if product is None:
+                logger.warning(
+                    "Amazon card skipped category=%s asin=%s stage=validation",
+                    category,
+                    asin_for_log,
+                )
+                self.failed_items += 1
+                return None
+
+            logger.info(
+                "Amazon product parsed category=%s asin=%s stage=parsed",
+                category,
+                asin,
+            )
+            return product
+        except Exception:
+            self.failed_items += 1
+            logger.exception(
+                "Amazon card failed category=%s asin=%s stage=parse",
+                category,
+                asin_for_log,
+            )
+            return None
+
     def parse_page(
         self,
         page,
@@ -107,64 +184,20 @@ class AmazonBestSellersScraper:
         limit: int | None = None,
     ) -> list[ScrapedProduct]:
         products: list[ScrapedProduct] = []
-        limit = limit or self.products_per_category
         cards = self._cards(page)
+        effective_limit = limit or self.products_per_category
 
         for index in range(cards.count()):
-            if len(products) >= limit:
+            if len(products) >= effective_limit:
                 break
-            card = cards.nth(index)
-            asin_for_log = "unknown"
-            try:
-                href = self._first_attribute(card, LINK_SELECTORS, "href")
-                asin = extract_asin(card.get_attribute("data-asin"), href)
-                asin_for_log = asin or "missing"
-                title = self._first_text(card, TITLE_SELECTORS)
-                image_url = self._first_attribute(card, IMAGE_SELECTORS, "src")
-                if not title:
-                    title = self._first_attribute(card, IMAGE_SELECTORS, "alt")
-                if not asin or not title:
-                    logger.warning(
-                        "Amazon card skipped category=%s asin=%s stage=validation",
-                        category,
-                        asin_for_log,
-                    )
-                    self.failed_items += 1
-                    continue
 
-                products.append(
-                    ScrapedProduct(
-                        asin=asin,
-                        title=title,
-                        category=category,
-                        price=parse_price(self._first_text(card, PRICE_SELECTORS)),
-                        rating=parse_rating(
-                            self._first_text(card, RATING_SELECTORS)
-                            or self._first_attribute(
-                                card,
-                                RATING_SELECTORS,
-                                "aria-label",
-                            )
-                        ),
-                        reviews_count=parse_reviews_count(
-                            self._first_text(card, REVIEWS_SELECTORS)
-                        ),
-                        product_url=clean_product_url(href, asin),
-                        image_url=image_url,
-                    )
-                )
-                logger.info(
-                    "Amazon product parsed category=%s asin=%s stage=parsed",
-                    category,
-                    asin,
-                )
-            except Exception:
-                self.failed_items += 1
-                logger.exception(
-                    "Amazon card failed category=%s asin=%s stage=parse",
-                    category,
-                    asin_for_log,
-                )
+            product = self._parse_card_safely(
+                cards.nth(index),
+                category=category,
+            )
+            if product is not None:
+                products.append(product)
+
         return products
 
     def _navigate(self, page, url: str) -> None:
@@ -200,52 +233,74 @@ class AmazonBestSellersScraper:
         href = link.first.get_attribute("href") or ""
         return urljoin(self.base_url, href), configured_category
 
-    def scrape(self) -> list[ScrapedProduct]:
+    @staticmethod
+    def _load_sync_playwright():
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise BrowserStartupError(
                 "Playwright is not installed in this container; run the task in worker"
             ) from exc
+        return sync_playwright
+
+    def _launch_browser(self, playwright):
+        try:
+            return playwright.chromium.launch(headless=self.headless)
+        except Exception as exc:
+            raise BrowserStartupError("Playwright Chromium could not start") from exc
+
+    def _scrape_category(
+        self,
+        page,
+        configured_category: str,
+    ) -> list[ScrapedProduct]:
+        if configured_category:
+            url, fallback_category = self._resolve_target(
+                page,
+                configured_category,
+            )
+        else:
+            url, fallback_category = self.base_url, "Best Sellers"
+
+        logger.info(
+            "Amazon category started category=%s stage=navigate",
+            fallback_category,
+        )
+        self._navigate(page, url)
+        category = self._category_name(page, fallback_category)
+        parsed = self.parse_page(page, category=category)
+        self.categories_processed += 1
+        logger.info(
+            "Amazon category finished category=%s stage=complete products=%s",
+            category,
+            len(parsed),
+        )
+        return parsed
+
+    def _collect_categories(
+        self,
+        page,
+        configured_targets: list[str],
+    ) -> dict[str, ScrapedProduct]:
+        collected: dict[str, ScrapedProduct] = {}
+        for configured_category in configured_targets:
+            for product in self._scrape_category(page, configured_category):
+                collected[product.asin] = product
+        return collected
+
+    def scrape(self) -> list[ScrapedProduct]:
+        sync_playwright = self._load_sync_playwright()
 
         self.failed_items = 0
         self.categories_processed = 0
         configured_targets = self.categories or [""]
-        collected: dict[str, ScrapedProduct] = {}
 
         with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.launch(headless=self.headless)
-            except Exception as exc:
-                raise BrowserStartupError("Playwright Chromium could not start") from exc
-
+            browser = self._launch_browser(playwright)
             try:
                 page = browser.new_page()
                 page.set_default_timeout(self.request_timeout_ms)
-                for configured_category in configured_targets:
-                    if configured_category:
-                        url, fallback_category = self._resolve_target(
-                            page,
-                            configured_category,
-                        )
-                    else:
-                        url, fallback_category = self.base_url, "Best Sellers"
-
-                    logger.info(
-                        "Amazon category started category=%s stage=navigate",
-                        fallback_category,
-                    )
-                    self._navigate(page, url)
-                    category = self._category_name(page, fallback_category)
-                    parsed = self.parse_page(page, category=category)
-                    self.categories_processed += 1
-                    for product in parsed:
-                        collected[product.asin] = product
-                    logger.info(
-                        "Amazon category finished category=%s stage=complete products=%s",
-                        category,
-                        len(parsed),
-                    )
+                collected = self._collect_categories(page, configured_targets)
             finally:
                 browser.close()
 

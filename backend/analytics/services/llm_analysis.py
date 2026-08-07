@@ -23,8 +23,9 @@ class AnthropicAnalysisClient:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def generate_explanation(self, *, product, score) -> str:
-        prompt = {
+    @staticmethod
+    def _build_prompt(*, product, score) -> dict:
+        return {
             "product": {
                 "title": product.title,
                 "category": product.category,
@@ -40,7 +41,10 @@ class AnthropicAnalysisClient:
             "trend": score.input_snapshot["trends"],
             "historical_match": score.boost.reason,
         }
-        payload = json.dumps(
+
+    def _build_request_payload(self, *, product, score) -> bytes:
+        prompt = self._build_prompt(product=product, score=score)
+        return json.dumps(
             {
                 "model": self.model,
                 "max_tokens": 350,
@@ -58,7 +62,9 @@ class AnthropicAnalysisClient:
                 ],
             }
         ).encode("utf-8")
-        request = Request(
+
+    def _build_request(self, payload: bytes) -> Request:
+        return Request(
             ANTHROPIC_MESSAGES_URL,
             data=payload,
             headers={
@@ -68,6 +74,8 @@ class AnthropicAnalysisClient:
             },
             method="POST",
         )
+
+    def _send_request(self, request: Request) -> bytes:
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 raw_response = response.read(MAX_LLM_RESPONSE_BYTES + 1)
@@ -78,6 +86,10 @@ class AnthropicAnalysisClient:
 
         if len(raw_response) > MAX_LLM_RESPONSE_BYTES:
             raise LLMAnalysisError("LLM explanation response is too large")
+        return raw_response
+
+    @staticmethod
+    def _extract_response_text(raw_response: bytes) -> str:
         try:
             document = json.loads(raw_response.decode("utf-8"))
             content = document.get("content")
@@ -94,6 +106,14 @@ class AnthropicAnalysisClient:
             UnicodeError,
         ) as exc:
             raise LLMAnalysisError("LLM explanation response is malformed") from exc
+
+        return text
+
+    def generate_explanation(self, *, product, score) -> str:
+        payload = self._build_request_payload(product=product, score=score)
+        request = self._build_request(payload)
+        raw_response = self._send_request(request)
+        text = self._extract_response_text(raw_response)
         return validate_llm_explanation(text)
 
 

@@ -13,22 +13,12 @@ DETERMINISTIC_PROVIDER = "deterministic"
 DETERMINISTIC_MODEL = "fallback-v1"
 
 
-def create_product_analysis(
-    product,
-    *,
-    trend_snapshot=None,
-    successful_products=(),
-    llm_client=None,
-) -> ProductAnalysis:
-    score = calculate_product_score(
-        product,
-        trend_snapshot=trend_snapshot,
-        successful_products=successful_products,
-    )
+def _resolve_explanation(product, score, llm_client) -> tuple[str, str, str, str]:
     reasoning = build_fallback_explanation(product, score)
     provider = DETERMINISTIC_PROVIDER
     model_name = DETERMINISTIC_MODEL
     llm_status = "not_configured"
+
     if llm_client is not None:
         try:
             llm_reasoning = llm_client.generate_explanation(
@@ -43,6 +33,27 @@ def create_product_analysis(
             raise
         except Exception:
             llm_status = "fallback_after_error"
+
+    return reasoning, provider, model_name, llm_status
+
+
+def create_product_analysis(
+    product,
+    *,
+    trend_snapshot=None,
+    successful_products=(),
+    llm_client=None,
+) -> ProductAnalysis:
+    score = calculate_product_score(
+        product,
+        trend_snapshot=trend_snapshot,
+        successful_products=successful_products,
+    )
+    reasoning, provider, model_name, llm_status = _resolve_explanation(
+        product,
+        score,
+        llm_client,
+    )
 
     input_snapshot = dict(score.input_snapshot)
     input_snapshot["explanation"] = {
