@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass, field
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from celery import shared_task
@@ -31,6 +32,13 @@ TRENDS_SOFT_TIMEOUT_MESSAGE = "Google Trends collection stopped by soft timeout"
 ANALYSIS_SOFT_TIMEOUT_MESSAGE = "Product analysis stopped by soft timeout"
 
 
+@dataclass
+class _BatchProgress:
+    processed_items: int = 0
+    failed_items: int = 0
+    errors: list[dict[str, str | int]] = field(default_factory=list)
+
+
 def _mark_failed(job: JobRun, exc: Exception) -> None:
     job.status = JobRun.Status.FAILED
     job.error_message = str(exc)
@@ -42,6 +50,72 @@ def _mark_failed(job: JobRun, exc: Exception) -> None:
             "finished_at",
         ]
     )
+
+
+def _start_batch_job(job: JobRun, *, task_id: str | None, total_items: int) -> None:
+    job.status = JobRun.Status.RUNNING
+    job.celery_task_id = task_id or job.celery_task_id
+    job.total_items = total_items
+    job.processed_items = 0
+    job.failed_items = 0
+    job.error_message = ""
+    job.details = {}
+    job.started_at = job.started_at or timezone.now()
+    job.finished_at = None
+    job.save(
+        update_fields=[
+            "status",
+            "celery_task_id",
+            "total_items",
+            "processed_items",
+            "failed_items",
+            "error_message",
+            "details",
+            "started_at",
+            "finished_at",
+        ]
+    )
+
+
+def _finish_empty_job(job: JobRun, message: str) -> None:
+    job.status = JobRun.Status.FAILED
+    job.error_message = message
+    job.finished_at = timezone.now()
+    job.save(update_fields=["status", "error_message", "finished_at"])
+
+
+def _finalize_batch_job(
+    job: JobRun,
+    *,
+    status: str,
+    progress: _BatchProgress,
+    error_message: str,
+    details: dict[str, object],
+) -> None:
+    job.status = status
+    job.processed_items = progress.processed_items
+    job.failed_items = progress.failed_items
+    job.error_message = error_message
+    job.details = details
+    job.finished_at = timezone.now()
+    job.save(
+        update_fields=[
+            "status",
+            "processed_items",
+            "failed_items",
+            "error_message",
+            "details",
+            "finished_at",
+        ]
+    )
+
+
+def _job_result(job: JobRun) -> dict[str, int]:
+    return {
+        "total_items": job.total_items,
+        "processed_items": job.processed_items,
+        "failed_items": job.failed_items,
+    }
 
 
 @shared_task(
@@ -354,6 +428,161 @@ def collect_google_trends(self, job_id: str) -> dict[str, int]:
     }
 
 
+def _load_analysis_context(products: list[Product]):
+    product_ids = [product.pk for product in products]
+    latest_snapshots = {
+        snapshot.product_id: snapshot
+        for snapshot in TrendSnapshot.objects.filter(product_id__in=product_ids)
+        .order_by("product_id", "-collected_at", "-pk")
+        .distinct("product_id")
+    }
+    successful_products = list(SuccessfulProduct.objects.order_by("pk"))
+    llm_client = build_llm_client(settings)
+    return latest_snapshots, successful_products, llm_client
+
+
+def _analyze_product(
+    product: Product,
+    *,
+    latest_snapshots: dict[int, TrendSnapshot],
+    successful_products: list[SuccessfulProduct],
+    llm_client,
+    progress: _BatchProgress,
+) -> None:
+    try:
+        create_product_analysis(
+            product,
+            trend_snapshot=latest_snapshots.get(product.pk),
+            successful_products=successful_products,
+            llm_client=llm_client,
+        )
+        progress.processed_items += 1
+    except SoftTimeLimitExceeded:
+        progress.failed_items += 1
+        progress.errors.append(
+            {
+                "product_id": product.pk,
+                "asin": product.asin,
+                "error": ANALYSIS_SOFT_TIMEOUT_MESSAGE,
+            }
+        )
+        raise
+    except Exception as exc:
+        error_message = str(exc)[:200]
+        progress.failed_items += 1
+        progress.errors.append(
+            {
+                "product_id": product.pk,
+                "asin": product.asin,
+                "error": error_message,
+            }
+        )
+        logger.warning(
+            "Product analysis failed product_id=%s asin=%s error=%s",
+            product.pk,
+            product.asin,
+            error_message,
+        )
+
+
+def _run_product_analysis(
+    products: list[Product],
+    progress: _BatchProgress,
+) -> None:
+    latest_snapshots, successful_products, llm_client = _load_analysis_context(
+        products
+    )
+    for product in products:
+        _analyze_product(
+            product,
+            latest_snapshots=latest_snapshots,
+            successful_products=successful_products,
+            llm_client=llm_client,
+            progress=progress,
+        )
+
+
+def _finalize_analysis_timeout(
+    job: JobRun,
+    *,
+    total_items: int,
+    progress: _BatchProgress,
+) -> None:
+    skipped_items = max(
+        0,
+        total_items - progress.processed_items - progress.failed_items,
+    )
+    progress.failed_items += skipped_items
+    _finalize_batch_job(
+        job,
+        status=JobRun.Status.FAILED,
+        progress=progress,
+        error_message=ANALYSIS_SOFT_TIMEOUT_MESSAGE,
+        details={
+            "errors_count": progress.failed_items,
+            "errors": progress.errors[:10],
+            "timeout": True,
+            "skipped_items": skipped_items,
+        },
+    )
+
+
+def _finalize_analysis_batch_failure(
+    job: JobRun,
+    *,
+    total_items: int,
+    progress: _BatchProgress,
+    exc: Exception,
+) -> None:
+    skipped_items = max(
+        0,
+        total_items - progress.processed_items - progress.failed_items,
+    )
+    progress.failed_items += skipped_items
+    progress.errors.append(
+        {"product_id": 0, "asin": "", "error": str(exc)[:200]}
+    )
+    _finalize_batch_job(
+        job,
+        status=JobRun.Status.FAILED,
+        progress=progress,
+        error_message="Product analysis batch failed",
+        details={
+            "errors_count": progress.failed_items,
+            "errors": progress.errors[:10],
+            "skipped_items": skipped_items,
+        },
+    )
+
+
+def _finalize_analysis_completion(
+    job: JobRun,
+    *,
+    total_items: int,
+    progress: _BatchProgress,
+) -> None:
+    status = (
+        JobRun.Status.SUCCEEDED
+        if progress.processed_items
+        else JobRun.Status.FAILED
+    )
+    error_message = (
+        f"{progress.failed_items} of {total_items} products failed product analysis"
+        if progress.failed_items
+        else ""
+    )
+    _finalize_batch_job(
+        job,
+        status=status,
+        progress=progress,
+        error_message=error_message,
+        details={
+            "errors_count": progress.failed_items,
+            "errors": progress.errors[:10],
+        },
+    )
+
+
 @shared_task(
     bind=True,
     name="analytics.analyze_products",
@@ -369,161 +598,38 @@ def analyze_products(self, job_id: str) -> dict[str, int]:
         raise ValueError(f"Product analysis JobRun must be pending, got {job.status}")
 
     products = list(Product.objects.order_by("pk"))
-    job.status = JobRun.Status.RUNNING
-    job.celery_task_id = self.request.id or job.celery_task_id
-    job.total_items = len(products)
-    job.processed_items = 0
-    job.failed_items = 0
-    job.error_message = ""
-    job.details = {}
-    job.started_at = job.started_at or timezone.now()
-    job.finished_at = None
-    job.save(
-        update_fields=[
-            "status",
-            "celery_task_id",
-            "total_items",
-            "processed_items",
-            "failed_items",
-            "error_message",
-            "details",
-            "started_at",
-            "finished_at",
-        ]
+    _start_batch_job(
+        job,
+        task_id=self.request.id,
+        total_items=len(products),
     )
 
     if not products:
-        job.status = JobRun.Status.FAILED
-        job.error_message = "No products available for product analysis"
-        job.finished_at = timezone.now()
-        job.save(update_fields=["status", "error_message", "finished_at"])
-        return {"total_items": 0, "processed_items": 0, "failed_items": 0}
+        _finish_empty_job(job, "No products available for product analysis")
+        return _job_result(job)
 
-    processed_items = 0
-    failed_items = 0
-    errors: list[dict[str, str | int]] = []
+    progress = _BatchProgress()
     try:
-        product_ids = [product.pk for product in products]
-        latest_snapshots = {
-            snapshot.product_id: snapshot
-            for snapshot in TrendSnapshot.objects.filter(
-                product_id__in=product_ids
-            )
-            .order_by("product_id", "-collected_at", "-pk")
-            .distinct("product_id")
-        }
-        successful_products = list(SuccessfulProduct.objects.order_by("pk"))
-        llm_client = build_llm_client(settings)
-
-        for product in products:
-            try:
-                create_product_analysis(
-                    product,
-                    trend_snapshot=latest_snapshots.get(product.pk),
-                    successful_products=successful_products,
-                    llm_client=llm_client,
-                )
-                processed_items += 1
-            except SoftTimeLimitExceeded:
-                failed_items += 1
-                errors.append(
-                    {
-                        "product_id": product.pk,
-                        "asin": product.asin,
-                        "error": ANALYSIS_SOFT_TIMEOUT_MESSAGE,
-                    }
-                )
-                raise
-            except Exception as exc:
-                failed_items += 1
-                errors.append(
-                    {
-                        "product_id": product.pk,
-                        "asin": product.asin,
-                        "error": str(exc)[:200],
-                    }
-                )
-                logger.warning(
-                    "Product analysis failed product_id=%s asin=%s error=%s",
-                    product.pk,
-                    product.asin,
-                    str(exc)[:200],
-                )
+        _run_product_analysis(products, progress)
     except SoftTimeLimitExceeded:
-        skipped_items = max(0, len(products) - processed_items - failed_items)
-        failed_items += skipped_items
-        job.status = JobRun.Status.FAILED
-        job.processed_items = processed_items
-        job.failed_items = failed_items
-        job.error_message = ANALYSIS_SOFT_TIMEOUT_MESSAGE
-        job.details = {
-            "errors_count": failed_items,
-            "errors": errors[:10],
-            "timeout": True,
-            "skipped_items": skipped_items,
-        }
-        job.finished_at = timezone.now()
-        job.save(
-            update_fields=[
-                "status",
-                "processed_items",
-                "failed_items",
-                "error_message",
-                "details",
-                "finished_at",
-            ]
+        _finalize_analysis_timeout(
+            job,
+            total_items=len(products),
+            progress=progress,
         )
         raise
     except Exception as exc:
-        skipped_items = max(0, len(products) - processed_items - failed_items)
-        failed_items += skipped_items
-        errors.append({"product_id": 0, "asin": "", "error": str(exc)[:200]})
-        job.status = JobRun.Status.FAILED
-        job.processed_items = processed_items
-        job.failed_items = failed_items
-        job.error_message = "Product analysis batch failed"
-        job.details = {
-            "errors_count": failed_items,
-            "errors": errors[:10],
-            "skipped_items": skipped_items,
-        }
-        job.finished_at = timezone.now()
-        job.save(
-            update_fields=[
-                "status",
-                "processed_items",
-                "failed_items",
-                "error_message",
-                "details",
-                "finished_at",
-            ]
+        _finalize_analysis_batch_failure(
+            job,
+            total_items=len(products),
+            progress=progress,
+            exc=exc,
         )
         raise
 
-    job.status = (
-        JobRun.Status.SUCCEEDED if processed_items else JobRun.Status.FAILED
+    _finalize_analysis_completion(
+        job,
+        total_items=len(products),
+        progress=progress,
     )
-    job.processed_items = processed_items
-    job.failed_items = failed_items
-    job.error_message = (
-        f"{failed_items} of {len(products)} products failed product analysis"
-        if failed_items
-        else ""
-    )
-    job.details = {"errors_count": failed_items, "errors": errors[:10]}
-    job.finished_at = timezone.now()
-    job.save(
-        update_fields=[
-            "status",
-            "processed_items",
-            "failed_items",
-            "error_message",
-            "details",
-            "finished_at",
-        ]
-    )
-    return {
-        "total_items": job.total_items,
-        "processed_items": job.processed_items,
-        "failed_items": job.failed_items,
-    }
+    return _job_result(job)
