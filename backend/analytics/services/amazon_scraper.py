@@ -99,6 +99,83 @@ class AmazonBestSellersScraper:
                 return cards
         return page.locator(".__amazon_card_selector_did_not_match__")
 
+    def _parse_product_card(
+        self,
+        card,
+        *,
+        category: str,
+        href: str,
+        asin: str | None,
+    ) -> ScrapedProduct | None:
+        title = self._first_text(card, TITLE_SELECTORS)
+        image_url = self._first_attribute(card, IMAGE_SELECTORS, "src")
+        if not title:
+            title = self._first_attribute(card, IMAGE_SELECTORS, "alt")
+        if not asin or not title:
+            return None
+
+        price = parse_price(self._first_text(card, PRICE_SELECTORS))
+        rating_text = self._first_text(card, RATING_SELECTORS) or self._first_attribute(
+            card,
+            RATING_SELECTORS,
+            "aria-label",
+        )
+        reviews_count = parse_reviews_count(
+            self._first_text(card, REVIEWS_SELECTORS)
+        )
+
+        return ScrapedProduct(
+            asin=asin,
+            title=title,
+            category=category,
+            price=price,
+            rating=parse_rating(rating_text),
+            reviews_count=reviews_count,
+            product_url=clean_product_url(href, asin),
+            image_url=image_url,
+        )
+
+    def _parse_card_safely(
+        self,
+        card,
+        *,
+        category: str,
+    ) -> ScrapedProduct | None:
+        asin_for_log = "unknown"
+        try:
+            href = self._first_attribute(card, LINK_SELECTORS, "href")
+            asin = extract_asin(card.get_attribute("data-asin"), href)
+            asin_for_log = asin or "missing"
+            product = self._parse_product_card(
+                card,
+                category=category,
+                href=href,
+                asin=asin,
+            )
+            if product is None:
+                logger.warning(
+                    "Amazon card skipped category=%s asin=%s stage=validation",
+                    category,
+                    asin_for_log,
+                )
+                self.failed_items += 1
+                return None
+
+            logger.info(
+                "Amazon product parsed category=%s asin=%s stage=parsed",
+                category,
+                asin,
+            )
+            return product
+        except Exception:
+            self.failed_items += 1
+            logger.exception(
+                "Amazon card failed category=%s asin=%s stage=parse",
+                category,
+                asin_for_log,
+            )
+            return None
+
     def parse_page(
         self,
         page,
@@ -107,64 +184,20 @@ class AmazonBestSellersScraper:
         limit: int | None = None,
     ) -> list[ScrapedProduct]:
         products: list[ScrapedProduct] = []
-        limit = limit or self.products_per_category
         cards = self._cards(page)
+        effective_limit = limit or self.products_per_category
 
         for index in range(cards.count()):
-            if len(products) >= limit:
+            if len(products) >= effective_limit:
                 break
-            card = cards.nth(index)
-            asin_for_log = "unknown"
-            try:
-                href = self._first_attribute(card, LINK_SELECTORS, "href")
-                asin = extract_asin(card.get_attribute("data-asin"), href)
-                asin_for_log = asin or "missing"
-                title = self._first_text(card, TITLE_SELECTORS)
-                image_url = self._first_attribute(card, IMAGE_SELECTORS, "src")
-                if not title:
-                    title = self._first_attribute(card, IMAGE_SELECTORS, "alt")
-                if not asin or not title:
-                    logger.warning(
-                        "Amazon card skipped category=%s asin=%s stage=validation",
-                        category,
-                        asin_for_log,
-                    )
-                    self.failed_items += 1
-                    continue
 
-                products.append(
-                    ScrapedProduct(
-                        asin=asin,
-                        title=title,
-                        category=category,
-                        price=parse_price(self._first_text(card, PRICE_SELECTORS)),
-                        rating=parse_rating(
-                            self._first_text(card, RATING_SELECTORS)
-                            or self._first_attribute(
-                                card,
-                                RATING_SELECTORS,
-                                "aria-label",
-                            )
-                        ),
-                        reviews_count=parse_reviews_count(
-                            self._first_text(card, REVIEWS_SELECTORS)
-                        ),
-                        product_url=clean_product_url(href, asin),
-                        image_url=image_url,
-                    )
-                )
-                logger.info(
-                    "Amazon product parsed category=%s asin=%s stage=parsed",
-                    category,
-                    asin,
-                )
-            except Exception:
-                self.failed_items += 1
-                logger.exception(
-                    "Amazon card failed category=%s asin=%s stage=parse",
-                    category,
-                    asin_for_log,
-                )
+            product = self._parse_card_safely(
+                cards.nth(index),
+                category=category,
+            )
+            if product is not None:
+                products.append(product)
+
         return products
 
     def _navigate(self, page, url: str) -> None:
