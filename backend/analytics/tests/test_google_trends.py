@@ -345,6 +345,7 @@ class GoogleTrendsResponseTests(SimpleTestCase):
             collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
 
         message = str(raised.exception)
+        self.assertEqual(message, module.GOOGLE_TRENDS_RATE_LIMIT_MESSAGE)
         self.assertIn("rate limit", message.lower())
         self.assertNotIn(response_body_secret, message)
         self.assertNotIn(cookie_secret, message)
@@ -475,6 +476,217 @@ class GoogleTrendsResponseTests(SimpleTestCase):
         timeline_response.text.assert_not_called()
         parse_response.assert_not_called()
         page.close.assert_called_once()
+
+
+class GoogleTrendsCollectionCharacterizationTests(SimpleTestCase):
+    def make_runtime(
+        self,
+        module,
+        *,
+        navigation_status=200,
+        timeline_status=200,
+        response_text="timeline-response-body",
+    ):
+        collector = module.GoogleTrendsCollector(request_timeout_seconds=12)
+        page = MagicMock()
+        collector._browser = MagicMock()
+        collector._browser.new_page.return_value = page
+
+        navigation_response = MagicMock()
+        navigation_response.status = navigation_status
+        page.goto.return_value = navigation_response
+
+        timeline_response = MagicMock()
+        timeline_response.url = timeline_response_url()
+        timeline_response.status = timeline_status
+        timeline_response.text.return_value = response_text
+        response_info = SimpleNamespace(value=timeline_response)
+        response_context = MagicMock()
+        response_context.__enter__.return_value = response_info
+        response_context.__exit__.return_value = False
+        page.expect_response.return_value = response_context
+        return collector, page, timeline_response, response_context
+
+    def test_success_preserves_request_pipeline_logging_and_cleanup(self):
+        module = google_trends_module()
+        collector, page, timeline_response, response_context = self.make_runtime(
+            module
+        )
+        candidate = SimpleNamespace(url=timeline_response_url())
+
+        def expect_response(predicate, *, timeout):
+            self.assertTrue(predicate(candidate))
+            self.assertEqual(timeout, 12_000)
+            return response_context
+
+        page.expect_response.side_effect = expect_response
+        expected_series = [40, 50, 70]
+        expected_metrics = SimpleNamespace(current_interest=70)
+
+        with (
+            patch.object(
+                module,
+                "is_matching_timeline_response",
+                return_value=True,
+            ) as response_matches,
+            patch.object(
+                module,
+                "parse_google_trends_response",
+                return_value=expected_series,
+            ) as parse_response,
+            patch.object(
+                module,
+                "calculate_trend_metrics",
+                return_value=expected_metrics,
+            ) as calculate_metrics,
+            self.assertLogs(
+                "analytics.services.google_trends",
+                level="INFO",
+            ) as logs,
+        ):
+            result = collector._collect_response(
+                keyword=KEYWORD,
+                geo=GEO,
+                period=PERIOD,
+            )
+
+        self.assertIs(result, expected_metrics)
+        collector._browser.new_page.assert_called_once_with()
+        page.set_default_timeout.assert_called_once_with(12_000)
+        page.goto.assert_called_once_with(
+            "https://trends.google.com/trends/explore?"
+            "q=wireless+headphones&geo=US&date=today+3-m",
+            wait_until="domcontentloaded",
+            timeout=12_000,
+        )
+        response_matches.assert_called_once_with(
+            candidate.url,
+            keyword=KEYWORD,
+            geo=GEO,
+            period=PERIOD,
+        )
+        timeline_response.text.assert_called_once_with()
+        parse_response.assert_called_once_with("timeline-response-body")
+        calculate_metrics.assert_called_once_with(expected_series)
+        page.close.assert_called_once_with()
+        self.assertIn(
+            "Google Trends request finished keyword=wireless headphones "
+            "geo=US period=today 3-m stage=parsed points=3",
+            logs.output[-1],
+        )
+
+    def test_timeline_http_error_preserves_exact_error_and_cleanup(self):
+        module = google_trends_module()
+        collector, page, response, _ = self.make_runtime(
+            module,
+            timeline_status=503,
+        )
+
+        with self.assertRaises(module.GoogleTrendsNetworkError) as raised:
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertEqual(str(raised.exception), "Google Trends returned HTTP 503")
+        response.text.assert_not_called()
+        page.close.assert_called_once_with()
+
+    def test_response_read_failure_preserves_exact_error_and_cleanup(self):
+        module = google_trends_module()
+        collector, page, response, _ = self.make_runtime(module)
+        read_error = RuntimeError("response body unavailable")
+        response.text.side_effect = read_error
+
+        with self.assertRaises(module.GoogleTrendsNetworkError) as raised:
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertEqual(
+            str(raised.exception),
+            "Could not read the Google Trends timeline response",
+        )
+        self.assertIs(raised.exception.__cause__, read_error)
+        page.close.assert_called_once_with()
+
+    def test_playwright_timeout_preserves_exact_error_and_cleanup(self):
+        module = google_trends_module()
+        playwright_module = import_module("playwright.sync_api")
+        collector, page, _, _ = self.make_runtime(module)
+        timeout = playwright_module.TimeoutError("timeline wait timed out")
+        page.goto.side_effect = timeout
+
+        with self.assertRaises(module.GoogleTrendsTimeoutError) as raised:
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertEqual(
+            str(raised.exception),
+            "Timed out waiting for Google Trends timeline data",
+        )
+        self.assertIs(raised.exception.__cause__, timeout)
+        page.close.assert_called_once_with()
+
+    def test_parse_error_propagates_unchanged_and_closes_page(self):
+        module = google_trends_module()
+        collector, page, _, _ = self.make_runtime(module)
+        parse_error = module.GoogleTrendsParseError("invalid timeline")
+
+        with (
+            patch.object(
+                module,
+                "parse_google_trends_response",
+                side_effect=parse_error,
+            ),
+            self.assertRaises(module.GoogleTrendsParseError) as raised,
+        ):
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertIs(raised.exception, parse_error)
+        page.close.assert_called_once_with()
+
+    def test_unexpected_navigation_error_preserves_exact_error_and_cleanup(self):
+        module = google_trends_module()
+        collector, page, _, _ = self.make_runtime(module)
+        navigation_error = RuntimeError("browser disconnected")
+        page.goto.side_effect = navigation_error
+
+        with self.assertRaises(module.GoogleTrendsNetworkError) as raised:
+            collector._collect_response(keyword=KEYWORD, geo=GEO, period=PERIOD)
+
+        self.assertEqual(
+            str(raised.exception),
+            "Google Trends browser navigation failed",
+        )
+        self.assertIs(raised.exception.__cause__, navigation_error)
+        page.close.assert_called_once_with()
+
+    def test_ordinary_page_close_failure_is_logged_and_swallowed(self):
+        module = google_trends_module()
+        collector, page, _, _ = self.make_runtime(module)
+        page.close.side_effect = RuntimeError("page cleanup failed")
+        expected_metrics = SimpleNamespace(current_interest=70)
+
+        with (
+            patch.object(
+                module,
+                "parse_google_trends_response",
+                return_value=[40, 50, 70],
+            ),
+            patch.object(
+                module,
+                "calculate_trend_metrics",
+                return_value=expected_metrics,
+            ),
+            self.assertLogs(
+                "analytics.services.google_trends",
+                level="WARNING",
+            ) as logs,
+        ):
+            result = collector._collect_response(
+                keyword=KEYWORD,
+                geo=GEO,
+                period=PERIOD,
+            )
+
+        self.assertIs(result, expected_metrics)
+        page.close.assert_called_once_with()
+        self.assertIn("Google Trends page cleanup failed", logs.output[-1])
 
 
 class GoogleTrendsSoftTimeoutPassthroughTests(SimpleTestCase):

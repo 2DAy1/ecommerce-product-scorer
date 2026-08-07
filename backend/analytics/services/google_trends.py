@@ -227,11 +227,66 @@ class GoogleTrendsCollector:
             if started_here:
                 self.close()
 
+    @staticmethod
+    def _build_explore_url(*, keyword: str, geo: str, period: str) -> str:
+        query = urlencode({"q": keyword, "geo": geo, "date": period})
+        return f"{GOOGLE_TRENDS_EXPLORE_URL}?{query}"
+
+    def _wait_for_timeline_response(
+        self,
+        page,
+        *,
+        explore_url: str,
+        keyword: str,
+        geo: str,
+        period: str,
+    ):
+        with page.expect_response(
+            lambda response: is_matching_timeline_response(
+                response.url,
+                keyword=keyword,
+                geo=geo,
+                period=period,
+            ),
+            timeout=self.request_timeout_ms,
+        ) as response_info:
+            navigation_response = page.goto(
+                explore_url,
+                wait_until="domcontentloaded",
+                timeout=self.request_timeout_ms,
+            )
+            if navigation_response is not None and navigation_response.status == 429:
+                raise GoogleTrendsRateLimitError(GOOGLE_TRENDS_RATE_LIMIT_MESSAGE)
+        return response_info.value
+
+    @staticmethod
+    def _validate_timeline_response(response) -> None:
+        if response.status == 429:
+            raise GoogleTrendsRateLimitError(GOOGLE_TRENDS_RATE_LIMIT_MESSAGE)
+        if response.status >= 400:
+            raise GoogleTrendsNetworkError(
+                f"Google Trends returned HTTP {response.status}"
+            )
+
+    @staticmethod
+    def _read_timeline_response(response) -> str:
+        try:
+            return response.text()
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:
+            raise GoogleTrendsNetworkError(
+                "Could not read the Google Trends timeline response"
+            ) from exc
+
     def _collect_response(self, *, keyword: str, geo: str, period: str) -> TrendMetrics:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-        query = urlencode({"q": keyword, "geo": geo, "date": period})
-        explore_url = f"{GOOGLE_TRENDS_EXPLORE_URL}?{query}"
+        explore_url = self._build_explore_url(
+            keyword=keyword,
+            geo=geo,
+            period=period,
+        )
         page = None
         logger.info(
             "Google Trends request started keyword=%s geo=%s period=%s stage=navigate",
@@ -242,42 +297,15 @@ class GoogleTrendsCollector:
         try:
             page = self._browser.new_page()
             page.set_default_timeout(self.request_timeout_ms)
-            with page.expect_response(
-                lambda response: is_matching_timeline_response(
-                    response.url,
-                    keyword=keyword,
-                    geo=geo,
-                    period=period,
-                ),
-                timeout=self.request_timeout_ms,
-            ) as response_info:
-                navigation_response = page.goto(
-                    explore_url,
-                    wait_until="domcontentloaded",
-                    timeout=self.request_timeout_ms,
-                )
-                if (
-                    navigation_response is not None
-                    and navigation_response.status == 429
-                ):
-                    raise GoogleTrendsRateLimitError(
-                        GOOGLE_TRENDS_RATE_LIMIT_MESSAGE
-                    )
-            response = response_info.value
-            if response.status == 429:
-                raise GoogleTrendsRateLimitError(GOOGLE_TRENDS_RATE_LIMIT_MESSAGE)
-            if response.status >= 400:
-                raise GoogleTrendsNetworkError(
-                    f"Google Trends returned HTTP {response.status}"
-                )
-            try:
-                response_text = response.text()
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as exc:
-                raise GoogleTrendsNetworkError(
-                    "Could not read the Google Trends timeline response"
-                ) from exc
+            response = self._wait_for_timeline_response(
+                page,
+                explore_url=explore_url,
+                keyword=keyword,
+                geo=geo,
+                period=period,
+            )
+            self._validate_timeline_response(response)
+            response_text = self._read_timeline_response(response)
             series = parse_google_trends_response(response_text)
             metrics = calculate_trend_metrics(series)
             logger.info(
