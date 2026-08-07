@@ -2,9 +2,10 @@ from datetime import timedelta
 from decimal import Decimal
 from importlib import import_module
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from billiard.exceptions import SoftTimeLimitExceeded
+from django.conf import settings
 from django.test import TestCase, tag
 from django.utils import timezone
 
@@ -75,6 +76,135 @@ class CollectGoogleTrendsTaskTests(TestCase):
         self.assertEqual(result["processed_items"], 2)
         self.assertEqual(collect_product.call_count, 2)
         collector_class.assert_called_once()
+
+    def test_products_use_pk_order_and_share_configured_collector(self):
+        tasks, task = trend_task()
+        products = list(Product.objects.order_by("pk"))
+        with (
+            patch.object(tasks, "GoogleTrendsCollector") as collector_class,
+            patch.object(
+                tasks,
+                "select_trend_keyword",
+                side_effect=["first keyword", "second keyword"],
+            ) as select_keyword,
+            patch.object(tasks, "collect_product_trend") as collect_product,
+        ):
+            collector = collector_class.return_value.__enter__.return_value
+
+            task.apply(
+                args=[str(self.job.id)],
+                task_id="trends-context",
+                throw=True,
+            ).get()
+
+        collector_class.assert_called_once_with(
+            headless=settings.TRENDS_HEADLESS,
+            request_timeout_seconds=settings.TRENDS_REQUEST_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            select_keyword.call_args_list,
+            [call(products[0]), call(products[1])],
+        )
+        self.assertEqual(
+            collect_product.call_args_list,
+            [
+                call(
+                    products[0],
+                    collector=collector,
+                    geo=settings.TRENDS_GEO,
+                    period=settings.TRENDS_PERIOD,
+                ),
+                call(
+                    products[1],
+                    collector=collector,
+                    geo=settings.TRENDS_GEO,
+                    period=settings.TRENDS_PERIOD,
+                ),
+            ],
+        )
+
+    def test_collector_startup_failure_preserves_current_batch_result(self):
+        tasks, task = trend_task()
+        with (
+            patch.object(tasks, "GoogleTrendsCollector") as collector_class,
+            patch.object(tasks, "collect_product_trend") as collect_product,
+        ):
+            collector_class.return_value.__enter__.side_effect = RuntimeError(
+                "collector startup failed"
+            )
+
+            result = task.apply(
+                args=[str(self.job.id)],
+                task_id="trends-startup-failed",
+                throw=True,
+            ).get()
+
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobRun.Status.FAILED)
+        self.assertEqual(self.job.processed_items, 0)
+        self.assertEqual(self.job.failed_items, 2)
+        self.assertEqual(
+            self.job.error_message,
+            "All 2 products failed trend collection",
+        )
+        self.assertEqual(
+            self.job.details,
+            {
+                "errors_count": 2,
+                "errors": [
+                    {
+                        "product_id": 0,
+                        "asin": "",
+                        "error": "collector startup failed",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
+            result,
+            {"total_items": 2, "processed_items": 0, "failed_items": 2},
+        )
+        collect_product.assert_not_called()
+
+    def test_collector_cleanup_failure_preserves_current_success_result(self):
+        tasks, task = trend_task()
+        with (
+            patch.object(tasks, "GoogleTrendsCollector") as collector_class,
+            patch.object(tasks, "collect_product_trend") as collect_product,
+        ):
+            collector_class.return_value.__exit__.side_effect = RuntimeError(
+                "collector cleanup failed"
+            )
+
+            result = task.apply(
+                args=[str(self.job.id)],
+                task_id="trends-cleanup-failed",
+                throw=True,
+            ).get()
+
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobRun.Status.SUCCEEDED)
+        self.assertEqual(self.job.processed_items, 2)
+        self.assertEqual(self.job.failed_items, 0)
+        self.assertEqual(self.job.error_message, "")
+        self.assertEqual(
+            self.job.details,
+            {
+                "errors_count": 0,
+                "errors": [
+                    {
+                        "product_id": 0,
+                        "asin": "",
+                        "error": "collector cleanup failed",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
+            result,
+            {"total_items": 2, "processed_items": 2, "failed_items": 0},
+        )
+        self.assertEqual(collect_product.call_count, 2)
 
     def test_one_product_failure_does_not_stop_remaining_products(self):
         tasks, task = trend_task()
