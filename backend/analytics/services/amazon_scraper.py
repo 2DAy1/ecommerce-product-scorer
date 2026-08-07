@@ -233,52 +233,74 @@ class AmazonBestSellersScraper:
         href = link.first.get_attribute("href") or ""
         return urljoin(self.base_url, href), configured_category
 
-    def scrape(self) -> list[ScrapedProduct]:
+    @staticmethod
+    def _load_sync_playwright():
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise BrowserStartupError(
                 "Playwright is not installed in this container; run the task in worker"
             ) from exc
+        return sync_playwright
+
+    def _launch_browser(self, playwright):
+        try:
+            return playwright.chromium.launch(headless=self.headless)
+        except Exception as exc:
+            raise BrowserStartupError("Playwright Chromium could not start") from exc
+
+    def _scrape_category(
+        self,
+        page,
+        configured_category: str,
+    ) -> list[ScrapedProduct]:
+        if configured_category:
+            url, fallback_category = self._resolve_target(
+                page,
+                configured_category,
+            )
+        else:
+            url, fallback_category = self.base_url, "Best Sellers"
+
+        logger.info(
+            "Amazon category started category=%s stage=navigate",
+            fallback_category,
+        )
+        self._navigate(page, url)
+        category = self._category_name(page, fallback_category)
+        parsed = self.parse_page(page, category=category)
+        self.categories_processed += 1
+        logger.info(
+            "Amazon category finished category=%s stage=complete products=%s",
+            category,
+            len(parsed),
+        )
+        return parsed
+
+    def _collect_categories(
+        self,
+        page,
+        configured_targets: list[str],
+    ) -> dict[str, ScrapedProduct]:
+        collected: dict[str, ScrapedProduct] = {}
+        for configured_category in configured_targets:
+            for product in self._scrape_category(page, configured_category):
+                collected[product.asin] = product
+        return collected
+
+    def scrape(self) -> list[ScrapedProduct]:
+        sync_playwright = self._load_sync_playwright()
 
         self.failed_items = 0
         self.categories_processed = 0
         configured_targets = self.categories or [""]
-        collected: dict[str, ScrapedProduct] = {}
 
         with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.launch(headless=self.headless)
-            except Exception as exc:
-                raise BrowserStartupError("Playwright Chromium could not start") from exc
-
+            browser = self._launch_browser(playwright)
             try:
                 page = browser.new_page()
                 page.set_default_timeout(self.request_timeout_ms)
-                for configured_category in configured_targets:
-                    if configured_category:
-                        url, fallback_category = self._resolve_target(
-                            page,
-                            configured_category,
-                        )
-                    else:
-                        url, fallback_category = self.base_url, "Best Sellers"
-
-                    logger.info(
-                        "Amazon category started category=%s stage=navigate",
-                        fallback_category,
-                    )
-                    self._navigate(page, url)
-                    category = self._category_name(page, fallback_category)
-                    parsed = self.parse_page(page, category=category)
-                    self.categories_processed += 1
-                    for product in parsed:
-                        collected[product.asin] = product
-                    logger.info(
-                        "Amazon category finished category=%s stage=complete products=%s",
-                        category,
-                        len(parsed),
-                    )
+                collected = self._collect_categories(page, configured_targets)
             finally:
                 browser.close()
 
